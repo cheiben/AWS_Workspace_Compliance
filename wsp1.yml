@@ -1,0 +1,70 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Enforce and verify Linux configuration files on AWS WorkSpaces (OS=Linux, Type=WorkSpace)
+  using AWS Systems Manager State Manager every 30 minutes. Detects drift via checksum (MD5)
+  and overwrites only when the local file differs from the golden copy in S3.
+
+Resources:
+  EnforceWorkSpaceLinuxConfigs:
+    Type: AWS::SSM::Association
+    Properties:
+      Name: "AWS-RunShellScript"
+      AssociationName: "EnforceWorkSpaceLinuxConfigs"
+      ScheduleExpression: "rate(30 minutes)"
+      ComplianceSeverity: HIGH
+      Targets:
+        - Key: tag:OS
+          Values: ["Linux"]
+        - Key: tag:Type
+          Values: ["WorkSpace"]
+      OutputLocation:
+        S3Location:
+          OutputS3BucketName: configurationhardlinux
+          OutputS3KeyPrefix: ssm-workspace-config-logs/
+      Parameters:
+        commands:
+          - |
+            set -euo pipefail
+            bucket="configurationhardlinux"
+            region="us-east-1"
+
+            echo "[$(date -Is)] Starting WorkSpace config enforcement (with drift detection)..."
+
+            hostname=$(hostname)
+            workspace_id=$(curl -s http://169.254.169.254/latest/meta-data/instance-id || echo "N/A")
+            echo "[INFO] Hostname: ${hostname}"
+            echo "[INFO] WorkSpaceID: ${workspace_id}"
+            echo "[INFO] Region: ${region}"
+
+            declare -A files=(
+              ["workspace/linux/sshd_config"]="/etc/ssh/sshd_config"
+              ["workspace/linux/motd"]="/etc/motd"
+            )
+
+            for src in "${!files[@]}"; do
+              dest="${files[$src]}"
+              echo "[CHECK] Verifying drift for ${dest}..."
+
+              # Get S3 MD5 (ETag)
+              remote_md5=$(aws s3api head-object --bucket "${bucket}" --key "${src}" --region "${region}" --query ETag --output text | tr -d '"')
+              # Get local MD5
+              local_md5=$(md5sum "${dest}" 2>/dev/null | awk '{print $1}' || echo "none")
+
+              if [ "${remote_md5}" != "${local_md5}" ]; then
+                echo "[DRIFT DETECTED] ${dest} differs from golden config in S3."
+                if aws s3 cp "s3://${bucket}/${src}" "${dest}" --region "${region}"; then
+                  chmod 600 "${dest}" || true
+                  echo "[FIXED] ${dest} replaced with golden copy."
+                else
+                  echo "[ERROR] Failed to restore ${dest} from S3!"
+                  exit 1
+                fi
+              else
+                echo "[OK] ${dest} is already compliant."
+              fi
+            done
+
+            echo "[INFO] Reloading SSH service..."
+            systemctl reload sshd 2>/dev/null || systemctl restart sshd 2>/dev/null || echo "[WARN] sshd reload failed"
+
+            echo "[$(date -Is)] Enforcement check complete for ${hostname} (${workspace_id})."
