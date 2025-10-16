@@ -1,0 +1,58 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Enforce Linux configuration files on AWS WorkSpaces (tagged OS=Linux, Type=WorkSpace)
+  using AWS Systems Manager State Manager. Pulls golden configs from S3 every 30 minutes
+  and reports compliance by WorkSpace ID and hostname.
+
+Resources:
+  EnforceWorkSpaceLinuxConfigs:
+    Type: AWS::SSM::Association
+    Properties:
+      Name: "AWS-RunShellScript"
+      AssociationName: "EnforceWorkSpaceLinuxConfigs"
+      ScheduleExpression: "rate(30 minutes)"
+      ComplianceSeverity: HIGH
+      Targets:
+        - Key: tag:OS
+          Values: ["Linux"]
+        - Key: tag:Type
+          Values: ["WorkSpace"]
+      OutputLocation:
+        S3Location:
+          OutputS3BucketName: configurationhardlinux
+          OutputS3KeyPrefix: ssm-workspace-config-logs/
+      Parameters:
+        commands:
+          - |
+            set -euo pipefail
+            bucket="configurationhardlinux"
+            region="us-east-1"
+
+            echo "[$(date -Is)] Starting WorkSpace config enforcement..."
+
+            # Identify the system
+            hostname=$(hostname)
+            workspace_id=$(curl -s http://169.254.169.254/latest/meta-data/instance-id || echo "N/A")
+            echo "[INFO] Hostname: ${hostname}"
+            echo "[INFO] WorkSpaceID: ${workspace_id}"
+            echo "[INFO] Region: ${region}"
+
+            # Define files to sync
+            declare -A files=(
+              ["workspace/linux/sshd_config"]="/etc/ssh/sshd_config"
+              ["workspace/linux/motd"]="/etc/motd"
+            )
+
+            # Pull configs from S3
+            for src in "${!files[@]}"; do
+              dest="${files[$src]}"
+              echo "[SYNC] s3://${bucket}/${src} -> ${dest}"
+              aws s3 cp "s3://${bucket}/${src}" "${dest}" --region "${region}"
+              chmod 600 "${dest}" || true
+            done
+
+            # Reload ssh service
+            echo "[INFO] Reloading SSH service..."
+            systemctl reload sshd 2>/dev/null || systemctl restart sshd 2>/dev/null || echo "[WARN] sshd reload failed"
+
+            echo "[$(date -Is)] Enforcement completed successfully for ${hostname} (${workspace_id})"
